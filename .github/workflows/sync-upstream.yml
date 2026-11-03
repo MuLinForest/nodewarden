@@ -15,6 +15,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # 不要讓 checkout 把 GITHUB_TOKEN (App installation token) 留在
+          # http.https://github.com/.extraheader，否則它會蓋掉下面 PAT 的認證。
+          persist-credentials: false
 
       - name: Configure git
         run: |
@@ -35,4 +38,6 @@ jobs:
         run: |
           git checkout main
           git merge upstream/main --no-edit
+          # 保險：清掉任何殘留的 GITHUB_TOKEN extraheader，確保用 PAT 推。
+          git config --local --unset-all "http.https://github.com/.extraheader" || true
           git push "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
