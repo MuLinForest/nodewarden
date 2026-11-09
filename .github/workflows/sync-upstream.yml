@@ -36,8 +36,74 @@ jobs:
           # 因此改用帶 repo+workflow scope 的 PAT（secret: SYNC_TOKEN）。
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
+          # 失敗原因寫進檔案, 讓後面的 Telegram step 讀得到(不靠解析 log)
+          reason_file="$RUNNER_TEMP/fail-reason.txt"
+          fail() {
+            printf '%s' "$1" > "$reason_file"
+            echo "::error::$1"
+            exit 1
+          }
+
           git checkout main
-          git merge upstream/main --no-edit
+          if ! git merge upstream/main --no-edit; then
+            conflicted=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            fail "merge 上游衝突:$conflicted"
+          fi
           # 保險：清掉任何殘留的 GITHUB_TOKEN extraheader，確保用 PAT 推。
           git config --local --unset-all "http.https://github.com/.extraheader" || true
-          git push "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
+          git push "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main \
+            || fail "push 被拒(SYNC_TOKEN 是否有 repo+workflow scope?)"
+          echo "✅ merged & pushed"
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TG_THREAD: ${{ secrets.TELEGRAM_THREAD_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          reason=""
+          if [ -f "$RUNNER_TEMP/fail-reason.txt" ]; then
+            reason=$(cat "$RUNNER_TEMP/fail-reason.txt")
+          fi
+          if [ -z "$reason" ]; then
+            reason="同步步驟異常結束(見 run 連結的 log)"
+          fi
+          reason=${reason:0:900}
+
+          text="⚠️ nodewarden 上游同步失敗
+          原因：$reason
+          分支：main(上游 shuaiplus/NodeWarden)
+          Run：$RUN_URL"
+
+          send_msg() {
+            local thread="$1"
+            local code
+            local args=(--data-urlencode "chat_id=$TG_CHAT" --data-urlencode "text=$text")
+            if [ -n "$thread" ]; then
+              args+=(--data-urlencode "message_thread_id=$thread")
+            fi
+            code=$(curl -s -m 15 -o "$RUNNER_TEMP/tg-resp.json" -w '%{http_code}' \
+              -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" "${args[@]}" \
+              --data-urlencode 'link_preview_options={"is_disabled":true}')
+            if [ "$code" = "200" ]; then
+              return 0
+            fi
+            echo "Telegram HTTP $code: $(cat "$RUNNER_TEMP/tg-resp.json" 2>/dev/null)"
+            return 1
+          }
+
+          delivered=0
+          if [ -n "${TG_THREAD:-}" ] && send_msg "$TG_THREAD"; then
+            delivered=1
+          elif [ -n "${TG_THREAD:-}" ]; then
+            echo "::warning::主題 $TG_THREAD 傳送失敗,改送主聊天"
+          fi
+          if [ "$delivered" -eq 0 ] && send_msg ""; then
+            delivered=1
+          fi
+          if [ "$delivered" -eq 0 ]; then
+            echo "::error::Telegram 通知完全失敗(token/chat id 未設或 API 拒絕)"
+            exit 1
+          fi
